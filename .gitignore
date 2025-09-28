@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Environments
+.venv/
+venv/
+.env
+
+# OS / misc
+.DS_Store
+*.log
+
+# Streamlit secrets and local info (never commit secrets)
+.streamlit/secrets.toml
+.streamlit/Info
+
+# Local data exports (PII / debug only)
+*.json
+

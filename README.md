@@ -62,3 +62,14 @@ direct = "From_Direct"
 
 ## Licence
 Usage interne KodjoEnglish.
+
+## Nouveautés UI
+- Sélecteur de source (Auto, GHL, Google Sheets, Local JSON) dans la barre latérale
+- Bouton d’actualisation qui vide les caches de chargement
+- Onglets: Vue d’ensemble, Sources, Setters, Pipeline, Diagnostics
+- Nouveaux graphiques: donut de sources, activité quotidienne, performance par setter, heatmap d’activité (jour × heure)
+- Mode sombre: activez "Mode sombre" dans la barre latérale (applique un thème foncé et un template Plotly sombre).
+
+## Branding
+- Logo affiché dans l’en‑tête et utilisé comme icône de page via `st.set_page_config(page_icon="kodjoenglish_logo.jpeg")`.
+ - Logo également visible dans la barre latérale.

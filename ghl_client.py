@@ -145,64 +145,107 @@ class GHLClient:
         data_keys: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         params = params.copy() if params else {}
-        # Use configured page size
         params.setdefault("limit", getattr(self.settings, "page_size", PAGE_SIZE))
         params.setdefault("offset", 0)
 
-        results: List[Dict[str, Any]] = []
-        base_url = self.settings.base_url.rstrip("/")
-        page_count = 0
         max_pages = max(1, getattr(self.settings, "max_pages", 50))
         pause = max(0.0, getattr(self.settings, "request_pause", 0.3))
         retries = max(0, getattr(self.settings, "max_retries", 2))
         backoff = max(0.0, getattr(self.settings, "retry_backoff", 1.0))
 
-        while True:
-            attempt = 0
+        # Candidate hosts: configured base + known alternates (deduplicated)
+        base = self.settings.base_url.rstrip("/")
+        candidates = [base]
+        for alt in ("https://rest.gohighlevel.com", "https://services.leadconnectorhq.com"):
+            alt = alt.rstrip("/")
+            if alt not in candidates:
+                candidates.append(alt)
+
+        last_error: Optional[requests.HTTPError] = None
+
+        for host in candidates:
+            page_count = 0
+            current_params = params.copy()
+            results: List[Dict[str, Any]] = []
             while True:
-                response = self.session.get(
-                    f"{base_url}{path}", params=params, timeout=TIMEOUT_SECONDS
-                )
-                try:
-                    response.raise_for_status()
+                host_404 = False
+                attempt = 0
+                while True:
+                    response = self.session.get(
+                        f"{host}{path}", params=current_params, timeout=TIMEOUT_SECONDS
+                    )
+                    try:
+                        response.raise_for_status()
+                        break
+                    except requests.HTTPError as exc:
+                        status = getattr(exc.response, "status_code", None)
+                        logger.error("GHL request failed: %s", exc)
+                        # Try retries for transient errors
+                        if status in (429, 500, 502, 503, 504) and attempt < retries:
+                            sleep_for = backoff * (2 ** attempt)
+                            time.sleep(sleep_for)
+                            attempt += 1
+                            continue
+                        # If 404, break this host and try next candidate
+                        if status == 404:
+                            last_error = exc
+                            results = []
+                            host_404 = True
+                            break
+                        # Other errors: give up for this host
+                        last_error = exc
+                        results = []
+                        break
+
+                if host_404:
+                    # Switch to next host
                     break
-                except requests.HTTPError as exc:
-                    status = getattr(exc.response, "status_code", None)
-                    logger.error("GHL request failed: %s", exc)
-                    if status in (429, 500, 502, 503, 504) and attempt < retries:
-                        sleep_for = backoff * (2 ** attempt)
-                        time.sleep(sleep_for)
-                        attempt += 1
-                        continue
-                    raise
 
-            payload = response.json()
-            items = _extract_items(payload, data_keys)
-            if not items:
-                break
+                payload = response.json()
+                items = _extract_items(payload, data_keys)
+                if not items:
+                    break
 
-            results.extend(items)
+                results.extend(items)
 
-            page_count += 1
-            if page_count >= max_pages:
-                logger.warning(
-                    "Reached max_pages=%s for %s; stopping pagination.", max_pages, path
-                )
-                break
+                page_count += 1
+                if page_count >= max_pages:
+                    logger.warning(
+                        "Reached max_pages=%s for %s; stopping pagination.", max_pages, path
+                    )
+                    break
 
-            if len(items) < params["limit"]:
-                break
-            params["offset"] += params["limit"]
-            if pause:
-                time.sleep(pause)
-        return results
+                if len(items) < current_params["limit"]:
+                    break
+                current_params["offset"] += current_params["limit"]
+                if pause:
+                    time.sleep(pause)
+
+            if results:
+                return results
+
+        # If all hosts failed or returned empty
+        return []
 
     def get_contacts(self, start: date, end: date) -> List[Dict[str, Any]]:
         params = {
             "startDate": start.isoformat(),
             "endDate": (end + timedelta(days=1)).isoformat(),
         }
-        return self.fetch_paginated("/v1/contacts/", params=params, data_keys=("contacts", "items"))
+        # Try v1 then v2 scoped to location
+        paths = [
+            "/v1/contacts/",
+        ]
+        if self.settings.location_id:
+            paths.append(f"/v2/locations/{self.settings.location_id}/contacts/search")
+        for p in paths:
+            try:
+                items = self.fetch_paginated(p, params=params, data_keys=("contacts", "items"))
+                if items:
+                    return items
+            except requests.HTTPError:
+                continue
+        return []
 
     def get_opportunities(self, start: date, end: date) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {
@@ -212,7 +255,21 @@ class GHLClient:
         if self.settings.pipeline_ids:
             # Use repeated query params for multiple pipelines
             params["pipelineId"] = list(self.settings.pipeline_ids)
-        return self.fetch_paginated("/v1/opportunities/", params=params, data_keys=("opportunities", "items"))
+        # Try common variants depending on account routing
+        paths = [
+            "/v1/opportunities/",
+            "/v1/opportunities/search",
+        ]
+        if self.settings.location_id:
+            paths.insert(1, f"/v2/locations/{self.settings.location_id}/opportunities/search")
+        for p in paths:
+            try:
+                items = self.fetch_paginated(p, params=params, data_keys=("opportunities", "items"))
+                if items:
+                    return items
+            except requests.HTTPError:
+                continue
+        return []
 
     def get_forms(self, start: date, end: date) -> List[Dict[str, Any]]:
         # Some accounts require explicit formId(s) for submissions; avoid noisy 400 if none configured
@@ -223,44 +280,69 @@ class GHLClient:
             "endDate": (end + timedelta(days=1)).isoformat(),
             "formId": list(self.settings.form_ids),
         }
-        return self.fetch_paginated(
-            "/v1/forms/submissions",
-            params=params,
-            data_keys=("forms", "submissions", "items"),
-        )
+        # Try both marketing and forms endpoints
+        for p in ("/v1/forms/submissions", "/v1/marketing/forms/submissions"):
+            try:
+                items = self.fetch_paginated(
+                    p,
+                    params=params,
+                    data_keys=("forms", "submissions", "items"),
+                )
+                if items:
+                    return items
+            except requests.HTTPError:
+                continue
+        return []
 
     def get_messages(self, start: date, end: date) -> List[Dict[str, Any]]:
         params = {
             "startDate": start.isoformat(),
             "endDate": (end + timedelta(days=1)).isoformat(),
         }
-        return self.fetch_paginated(
-            "/v1/conversations/messages/",
-            params=params,
-            data_keys=("messages", "items"),
-        )
+        for p in ("/v1/conversations/messages/", "/v1/conversations/messages/search"):
+            try:
+                items = self.fetch_paginated(p, params=params, data_keys=("messages", "items"))
+                if items:
+                    return items
+            except requests.HTTPError:
+                continue
+        return []
 
     def get_payments(self, start: date, end: date) -> List[Dict[str, Any]]:
         params = {
             "startDate": start.isoformat(),
             "endDate": (end + timedelta(days=1)).isoformat(),
         }
-        return self.fetch_paginated(
-            "/v1/payments/transactions/",
-            params=params,
-            data_keys=("transactions", "items"),
-        )
+        for p in ("/v1/payments/transactions/", (
+            f"/v2/locations/{self.settings.location_id}/payments/transactions" if self.settings.location_id else None
+        )):
+            if not p:
+                continue
+            try:
+                items = self.fetch_paginated(p, params=params, data_keys=("transactions", "items"))
+                if items:
+                    return items
+            except requests.HTTPError:
+                continue
+        return []
 
     def get_calls(self, start: date, end: date) -> List[Dict[str, Any]]:
         params = {
             "startDate": start.isoformat(),
             "endDate": (end + timedelta(days=1)).isoformat(),
         }
-        return self.fetch_paginated(
-            "/v1/calls/",
-            params=params,
-            data_keys=("calls", "items"),
-        )
+        for p in ("/v1/calls/", (
+            f"/v2/locations/{self.settings.location_id}/calls" if self.settings.location_id else None
+        )):
+            if not p:
+                continue
+            try:
+                items = self.fetch_paginated(p, params=params, data_keys=("calls", "items"))
+                if items:
+                    return items
+            except requests.HTTPError:
+                continue
+        return []
 
 
 # --- Transformation layer -------------------------------------------------
@@ -340,6 +422,59 @@ def build_dashboard_dataframe(
         len(payments),
         len(calls),
     )
+
+    # Build activity heatmap diagnostics (day-of-week x hour) if possible
+    if diag is not None:
+        try:
+            def _first_present(df: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
+                for c in candidates:
+                    if c in df.columns:
+                        return c
+                return None
+
+            def _to_hour_series(df: pd.DataFrame, candidates: Sequence[str]):
+                col = _first_present(df, candidates)
+                if not col:
+                    return pd.Series(dtype="datetime64[ns, UTC]")
+                ts = pd.to_datetime(df[col], errors="coerce", utc=True)
+                ts = ts.dropna()
+                if ts.empty:
+                    return ts
+                local = ts.dt.tz_convert(tz)
+                return local.dt.floor("H")
+
+            all_ts = []
+            if not contacts.empty:
+                all_ts.append(_to_hour_series(contacts, ("dateAdded", "createdAt")))
+            if not opportunities.empty:
+                all_ts.append(_to_hour_series(opportunities, ("updatedAt", "dateUpdated", "createdAt")))
+            if not forms.empty:
+                all_ts.append(_to_hour_series(forms, ("dateAdded", "createdAt", "submittedOn")))
+            if not messages.empty:
+                all_ts.append(_to_hour_series(messages, ("dateCreated", "createdOn", "timestamp")))
+            if not payments.empty:
+                all_ts.append(_to_hour_series(payments, ("dateCreated", "createdAt", "paidOn")))
+            if not calls.empty:
+                all_ts.append(_to_hour_series(calls, ("startTime", "dateCreated", "createdAt")))
+
+            if all_ts:
+                import numpy as np
+                ts_all = pd.concat(all_ts).dropna()
+                if not ts_all.empty:
+                    dow = ts_all.dt.dayofweek.astype(int)
+                    hr = ts_all.dt.hour.astype(int)
+                    df_counts = pd.DataFrame({"dow": dow, "hour": hr})
+                    mat = np.zeros((7, 24), dtype=int)
+                    for (d, h), cnt in df_counts.value_counts().items():
+                        mat[int(d), int(h)] = int(cnt)
+                    diag["activity_heatmap"] = {
+                        "matrix": mat.tolist(),
+                        "day_index": list(range(7)),
+                        "hour_index": list(range(24)),
+                    }
+        except Exception as _e:
+            # best-effort; do not fail build if diagnostics aggregation errors
+            pass
 
     # Prepare base index (Date x Setter)
     setters = _collect_setters([contacts, opportunities, forms, messages, payments, calls], settings=settings)

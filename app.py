@@ -8,6 +8,13 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import warnings
+
+# Silence noisy Plotly FutureWarning about to_pydatetime
+warnings.filterwarnings(
+    "ignore",
+    message="The behavior of DatetimeProperties.to_pydatetime is deprecated",
+)
 
 # Local helpers for GHL integration
 from ghl_client import (
@@ -284,6 +291,124 @@ def load_local_json_dataframe() -> Tuple[pd.DataFrame, Dict[str, Any]]:
         return pd.DataFrame(), {"source": "Local JSON", "errors": [str(exc)]}
 
 
+@st.cache_data(ttl=600)
+def load_github_json_dataframe() -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Load JSON files hosted on GitHub (raw URLs) if configured.
+
+    Configuration in `.streamlit/secrets.toml`:
+
+        [github]
+        # Either provide a base raw URL where the JSON files live
+        # Example: https://raw.githubusercontent.com/<user>/<repo>/<branch>/data/
+        raw_base = ""
+        # Or explicit URLs (any subset). If both are provided, explicit URLs win.
+        contacts_url = ""
+        opportunities_url = ""
+        forms_url = ""
+        messages_url = ""
+        payments_url = ""
+        calls_url = ""
+
+    Returns an empty dataframe if not configured or on failure.
+    """
+    try:
+        gh_conf = dict(st.secrets.get("github", {}))  # type: ignore[arg-type]
+        if not gh_conf:
+            return pd.DataFrame(), {"source": "GitHub JSON", "errors": ["github config missing in secrets"]}
+
+        def _build_url(name: str) -> Optional[str]:
+            explicit = gh_conf.get(f"{name}_url")
+            if explicit:
+                return str(explicit)
+            base = gh_conf.get("raw_base")
+            if base:
+                return str(base).rstrip("/") + f"/{name}.json"
+            return None
+
+        urls = {
+            "contacts": _build_url("contacts"),
+            "opportunities": _build_url("opportunities"),
+            "forms": _build_url("forms"),
+            "messages": _build_url("messages"),
+            "payments": _build_url("payments"),
+            "calls": _build_url("calls"),
+        }
+        if not any(urls.values()):
+            return pd.DataFrame(), {"source": "GitHub JSON", "errors": ["No URLs configured"]}
+
+        import requests as _requests
+
+        class GitHubJsonClient:
+            def __init__(self, settings: GHLSettings, urls_map: Dict[str, Optional[str]]) -> None:
+                self.settings = settings
+                self.urls_map = urls_map
+
+            def _fetch(self, name: str, keys: list[str]) -> list[dict]:
+                url = self.urls_map.get(name)
+                if not url:
+                    return []
+                try:
+                    r = _requests.get(url, timeout=15)
+                    r.raise_for_status()
+                    payload = r.json()
+                    if isinstance(payload, dict):
+                        for k in keys:
+                            if k in payload and isinstance(payload[k], list):
+                                return payload[k]
+                    if isinstance(payload, list):
+                        return payload
+                except Exception as e:
+                    logger.warning("GitHub JSON load failed for %s: %s", name, e)
+                return []
+
+            def get_contacts(self, start, end):
+                return self._fetch("contacts", ["contacts", "items"])
+
+            def get_opportunities(self, start, end):
+                return self._fetch("opportunities", ["opportunities", "items"])
+
+            def get_forms(self, start, end):
+                return self._fetch("forms", ["forms", "submissions", "items"])
+
+            def get_messages(self, start, end):
+                return self._fetch("messages", ["messages", "items"])
+
+            def get_payments(self, start, end):
+                return self._fetch("payments", ["transactions", "items"])
+
+            def get_calls(self, start, end):
+                return self._fetch("calls", ["calls", "items"])
+
+        # Settings for mapping/timezone
+        try:
+            settings = GHLSettings.from_streamlit(st.secrets)
+        except Exception:
+            tz = "UTC"
+            try:
+                if "ghl" in st.secrets and "timezone" in st.secrets["ghl"]:
+                    tz = str(st.secrets["ghl"]["timezone"])
+            except Exception:
+                pass
+            settings = GHLSettings(
+                api_key="dummy",
+                timezone=tz,
+                user_mapping={},
+                source_mapping={},
+                history_days=7,
+            )
+
+        gh_client = GitHubJsonClient(settings, urls)
+        diag: Dict[str, Any] = {}
+        df = build_dashboard_dataframe(gh_client, settings, diag=diag)
+        if not df.empty and "Date" in df.columns:
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        diag["source"] = "GitHub JSON"
+        return df, diag
+    except Exception as exc:
+        logger.info("GitHub JSON load failed: %s", exc)
+        return pd.DataFrame(), {"source": "GitHub JSON", "errors": [str(exc)]}
+
+
 def load_data(fast_days: Optional[int] = None) -> pd.DataFrame:
     """Try GHL first, then fallback to Google Sheets if configured."""
     # Attempt GHL
@@ -334,6 +459,16 @@ def load_data(fast_days: Optional[int] = None) -> pd.DataFrame:
             "setters_total_leads": df_tab.groupby("Setter")["Total_Leads"].sum().astype(int).to_dict() if "Setter" in df_tab and "Total_Leads" in df_tab else {},
         }
         return df_tab
+
+    # Fallback: GitHub JSON (if configured)
+    try:
+        df_gh, diag_gh = load_github_json_dataframe()
+        if not df_gh.empty:
+            st.session_state["data_source"] = "GitHub JSON"
+            st.session_state["diagnostics"] = diag_gh
+            return df_gh
+    except Exception as exc:
+        logger.info("GitHub JSON fallback not available or failed: %s", exc)
 
     # Fallback: Local JSON files in project root (contacts.json, ...)
     try:
@@ -779,15 +914,24 @@ def test_ghl_endpoints() -> Dict[str, Any]:
         paths = [
             ("contacts", "/v1/contacts/"),
             ("contacts", f"/v2/locations/{settings.location_id}/contacts/search") if settings.location_id else None,
+            ("contacts", f"/v2/locations/{settings.location_id}/contacts") if settings.location_id else None,
             ("opportunities", "/v1/opportunities/"),
             ("opportunities", "/v1/opportunities/search"),
             ("opportunities", f"/v2/locations/{settings.location_id}/opportunities/search") if settings.location_id else None,
+            ("opportunities", f"/v2/locations/{settings.location_id}/opportunities") if settings.location_id else None,
             ("messages", "/v1/conversations/messages/"),
             ("messages", "/v1/conversations/messages/search"),
+            ("messages", f"/v2/locations/{settings.location_id}/conversations/messages") if settings.location_id else None,
+            ("messages", f"/v2/locations/{settings.location_id}/conversations/messages/search") if settings.location_id else None,
             ("payments", "/v1/payments/transactions/"),
+            ("payments", "/v1/payments/transactions"),
+            ("payments", "/v1/payments/transactions/search"),
             ("payments", f"/v2/locations/{settings.location_id}/payments/transactions") if settings.location_id else None,
+            ("payments", f"/v2/locations/{settings.location_id}/payments/transactions/search") if settings.location_id else None,
             ("calls", "/v1/calls/"),
+            ("calls", "/v1/phone/calls"),
             ("calls", f"/v2/locations/{settings.location_id}/calls") if settings.location_id else None,
+            ("calls", f"/v2/locations/{settings.location_id}/phone/calls") if settings.location_id else None,
         ]
         paths = [p for p in paths if p]
 
@@ -829,9 +973,9 @@ def show_dashboard() -> None:
                                             help="Ignore GHL/Google Sheets si coché et utilise base.xlsx/csv s'ils existent")
     source_choice = st.sidebar.radio(
         "Source des données",
-        options=["Auto", "GHL API", "Google Sheets", "Local JSON"],
+        options=["Auto", "GHL API", "Google Sheets", "GitHub JSON", "Local JSON"],
         index=0,
-        help="Choisir la source: Auto (GHL puis fallback), GHL direct, Google Sheets ou JSON local."
+        help="Choisir la source: Auto (GHL puis fallback), GHL direct, Google Sheets, GitHub JSON ou JSON local."
     )
 
     # Auto-check GHL connectivity (période courte) une seule fois par session
@@ -912,6 +1056,11 @@ def show_dashboard() -> None:
                 "counts": {"sheet_rows": int(len(df_sheet))},
             }
         df = df_sheet
+    elif source_choice == "GitHub JSON":
+        df_gh, diag_gh = load_github_json_dataframe()
+        st.session_state["data_source"] = "GitHub JSON"
+        st.session_state["diagnostics"] = diag_gh
+        df = df_gh
     else:  # Local JSON
         df_local, diag_local = load_local_json_dataframe()
         st.session_state["data_source"] = "Local JSON"
@@ -933,16 +1082,59 @@ def show_dashboard() -> None:
     if "Date" in df_filtered:
         df_filtered = df_filtered[(df_filtered["Date"].dt.date >= start) & (df_filtered["Date"].dt.date <= end)]
 
-    # Setter filter
+    # Setter/Closer filter
     if "Setter" in df_filtered:
         setters = sorted([s for s in df_filtered["Setter"].dropna().unique()])
-        # Pré-sélectionner "Ingénieur Coffi" si présent, sinon tout
+        # Optional: restrict to closers defined in secrets
+        closers_names: list[str] = []
+        try:
+            ghl_conf = dict(st.secrets.get("ghl", {}))  # type: ignore[arg-type]
+            user_map = {str(k): str(v) for k, v in dict(ghl_conf.get("user_mapping", {})).items()}
+            raw_closers = ghl_conf.get("closers", []) or []
+            # Map IDs to names if needed; accept names as-is
+            for entry in raw_closers:
+                s = str(entry)
+                if s in user_map:
+                    closers_names.append(user_map[s])
+                else:
+                    closers_names.append(s)
+            # Keep only those present in current data
+            closers_names = sorted([n for n in set(closers_names) if n in setters])
+        except Exception:
+            closers_names = []
+
+        only_closers = False
+        if closers_names:
+            only_closers = st.sidebar.checkbox("Limiter aux closers", value=False, help="Utiliser la liste 'ghl.closers' des secrets")
+        selectable = closers_names if (closers_names and only_closers) else setters
+
+        # Pré-sélection par défaut: `ghl.default_users`, sinon bienvenue, sinon tout
         try:
             preferred = _welcome_name()
         except Exception:
             preferred = None
-        default_setters = [preferred] if preferred and preferred in setters else setters
-        selected = st.sidebar.multiselect("Setters", options=setters, default=default_setters)
+        defaults: list[str] = []
+        try:
+            default_users = [str(x) for x in dict(st.secrets.get("ghl", {})).get("default_users", [])]  # type: ignore[index]
+        except Exception:
+            default_users = []
+        # Map defaults similarly to closers (IDs -> names)
+        mapped_defaults: list[str] = []
+        if default_users:
+            try:
+                user_map = {str(k): str(v) for k, v in dict(st.secrets.get("ghl", {})).get("user_mapping", {}).items()}  # type: ignore[index]
+            except Exception:
+                user_map = {}
+            for d in default_users:
+                mapped_defaults.append(user_map.get(d, d))
+        if mapped_defaults:
+            defaults = [n for n in mapped_defaults if n in selectable]
+        elif preferred and preferred in selectable:
+            defaults = [preferred]
+        else:
+            defaults = selectable
+
+        selected = st.sidebar.multiselect("Setters", options=selectable, default=defaults)
         if selected:
             df_filtered = df_filtered[df_filtered["Setter"].isin(selected)]
 

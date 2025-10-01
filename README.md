@@ -34,6 +34,11 @@ downsell = ["PRODUCT_ID_DOWNSELL"]
 [ghl.user_mapping]
 "USER_ID" = "Nom lisible"
 
+[ghl]
+# Optionnels pour le filtrage par closers et les sélections par défaut
+closers = ["USER_ID_CLOSER_1", "Bohdan"]     # IDs (mappés via user_mapping) ou noms déjà mappés
+default_users = ["Bohdan"]                     # pré‑sélection dans le filtre des Setters
+
 [ghl.source_mapping]
 facebook = "From_FB"
 instagram = "From_Insta"
@@ -41,6 +46,19 @@ tiktok = "From_TikTok"
 linkedin = "From_LinkedIn"
 forms = "From_Forms"
 direct = "From_Direct"
+
+# (Optionnel) Chargement GitHub de JSON (mode debug/sans API)
+[github]
+# Soit un préfixe raw commun (recommandé)
+# Exemple: https://raw.githubusercontent.com/<user>/<repo>/<branch>/data
+raw_base = ""
+# Ou des URLs explicites (prioritaires si définies)
+# contacts_url = "https://raw.githubusercontent.com/.../contacts.json"
+# opportunities_url = "https://raw.githubusercontent.com/.../opportunities.json"
+# forms_url = "https://raw.githubusercontent.com/.../forms.json"
+# messages_url = "https://raw.githubusercontent.com/.../messages.json"
+# payments_url = "https://raw.githubusercontent.com/.../payments.json"
+# calls_url = "https://raw.githubusercontent.com/.../calls.json"
 ```
 
 - Google Sheets (facultatif): ajoutez `gcp_service_account` et `google_sheet_id` si vous souhaitez un mode secours.
@@ -49,6 +67,8 @@ direct = "From_Direct"
 - Panneau latéral: coche "Mode rapide (30 jours)" pour limiter les appels API à 30 jours récents. Décochez pour utiliser `history_days` (30 par défaut) ou les dates du filtre.
 - Bouton "Actualiser les données" vide le cache (15 min) et relance un chargement.
 - "Diagnostics" affiche source, période, en‑têtes, compteurs et erreurs API récentes.
+- Source des données: "Auto", "GHL API", "Google Sheets", "GitHub JSON", "Local JSON". Le mode "GitHub JSON" lit des fichiers JSON depuis des URLs raw GitHub définies dans `[github]`.
+- Filtre closers: si `ghl.closers` est défini, cochez "Limiter aux closers" pour ne montrer que ces utilisateurs. Utilisez `ghl.default_users` pour pré‑sélectionner (ex: ["Bohdan"]).
 
 ## Sécurité
 - Ne commitez jamais `./.streamlit/secrets.toml` ni `./.streamlit/Info` (protégés via `.gitignore`).
@@ -64,7 +84,7 @@ direct = "From_Direct"
 Usage interne KodjoEnglish.
 
 ## Nouveautés UI
-- Sélecteur de source (Auto, GHL, Google Sheets, Local JSON) dans la barre latérale
+- Sélecteur de source (Auto, GHL, Google Sheets, GitHub JSON, Local JSON) dans la barre latérale
 - Bouton d’actualisation qui vide les caches de chargement
 - Onglets: Vue d’ensemble, Sources, Setters, Pipeline, Diagnostics
 - Nouveaux graphiques: donut de sources, activité quotidienne, performance par setter, heatmap d’activité (jour × heure)

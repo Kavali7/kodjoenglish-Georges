@@ -156,7 +156,11 @@ class GHLClient:
         # Candidate hosts: configured base + known alternates (deduplicated)
         base = self.settings.base_url.rstrip("/")
         candidates = [base]
-        for alt in ("https://rest.gohighlevel.com", "https://services.leadconnectorhq.com"):
+        for alt in (
+            "https://rest.gohighlevel.com",
+            "https://services.leadconnectorhq.com",
+            "https://api.leadconnectorhq.com",
+        ):
             alt = alt.rstrip("/")
             if alt not in candidates:
                 candidates.append(alt)
@@ -179,7 +183,11 @@ class GHLClient:
                         break
                     except requests.HTTPError as exc:
                         status = getattr(exc.response, "status_code", None)
-                        logger.error("GHL request failed: %s", exc)
+                        # Reduce noise: 404 is expected when probing variant endpoints/hosts
+                        if status == 404:
+                            logger.debug("GHL 404 on %s%s with params=%s", host, path, current_params)
+                        else:
+                            logger.error("GHL request failed: %s", exc)
                         # Try retries for transient errors
                         if status in (429, 500, 502, 503, 504) and attempt < retries:
                             sleep_for = backoff * (2 ** attempt)
@@ -238,6 +246,7 @@ class GHLClient:
         ]
         if self.settings.location_id:
             paths.append(f"/v2/locations/{self.settings.location_id}/contacts/search")
+            paths.append(f"/v2/locations/{self.settings.location_id}/contacts")
         for p in paths:
             try:
                 items = self.fetch_paginated(p, params=params, data_keys=("contacts", "items"))
@@ -262,6 +271,7 @@ class GHLClient:
         ]
         if self.settings.location_id:
             paths.insert(1, f"/v2/locations/{self.settings.location_id}/opportunities/search")
+            paths.append(f"/v2/locations/{self.settings.location_id}/opportunities")
         for p in paths:
             try:
                 items = self.fetch_paginated(p, params=params, data_keys=("opportunities", "items"))
@@ -299,7 +309,13 @@ class GHLClient:
             "startDate": start.isoformat(),
             "endDate": (end + timedelta(days=1)).isoformat(),
         }
-        for p in ("/v1/conversations/messages/", "/v1/conversations/messages/search"):
+        for p in (
+            "/v1/conversations/messages/",
+            "/v1/conversations/messages/search",
+        ) + ((
+            f"/v2/locations/{self.settings.location_id}/conversations/messages",
+            f"/v2/locations/{self.settings.location_id}/conversations/messages/search",
+        ) if self.settings.location_id else ( )):
             try:
                 items = self.fetch_paginated(p, params=params, data_keys=("messages", "items"))
                 if items:
@@ -313,11 +329,17 @@ class GHLClient:
             "startDate": start.isoformat(),
             "endDate": (end + timedelta(days=1)).isoformat(),
         }
-        for p in ("/v1/payments/transactions/", (
-            f"/v2/locations/{self.settings.location_id}/payments/transactions" if self.settings.location_id else None
-        )):
-            if not p:
-                continue
+        paths: List[str] = [
+            "/v1/payments/transactions/",
+            "/v1/payments/transactions",
+            "/v1/payments/transactions/search",
+        ]
+        if self.settings.location_id:
+            paths += [
+                f"/v2/locations/{self.settings.location_id}/payments/transactions",
+                f"/v2/locations/{self.settings.location_id}/payments/transactions/search",
+            ]
+        for p in paths:
             try:
                 items = self.fetch_paginated(p, params=params, data_keys=("transactions", "items"))
                 if items:
@@ -331,11 +353,16 @@ class GHLClient:
             "startDate": start.isoformat(),
             "endDate": (end + timedelta(days=1)).isoformat(),
         }
-        for p in ("/v1/calls/", (
-            f"/v2/locations/{self.settings.location_id}/calls" if self.settings.location_id else None
-        )):
-            if not p:
-                continue
+        paths: List[str] = [
+            "/v1/calls/",
+            "/v1/phone/calls",
+        ]
+        if self.settings.location_id:
+            paths += [
+                f"/v2/locations/{self.settings.location_id}/calls",
+                f"/v2/locations/{self.settings.location_id}/phone/calls",
+            ]
+        for p in paths:
             try:
                 items = self.fetch_paginated(p, params=params, data_keys=("calls", "items"))
                 if items:
